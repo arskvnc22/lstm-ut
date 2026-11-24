@@ -2673,6 +2673,11 @@ def _print_recall_repeat_report(report: Mapping[str, Any]) -> None:
     model_label = {
         "dca_but": "BUT",
         "dca_cotf_cache": "CoTFormer",
+        "dca_gut": "GUT",
+        "dca_gated_but": "Gated BUT",
+        "dca_linmem_but": "Linear memory BUT",
+        "dca_fprm_but": "FPRM BUT",
+        "dca_decay_but": "Decay BUT",
     }.get(model_name, model_name)
 
     rendered = []
@@ -2918,6 +2923,56 @@ def _seed_series(
             values[(group_id, line)][x].append(value)
     return {"groups": groups, "raw": raw}, values
 
+def _plot_configuration_label(manifest: Mapping[str, Any]) -> str:
+    """Return a concise, readable label for plot legends."""
+
+    model = str(dotted_get(manifest, "model", "?"))
+    model_label = {
+        "but_full_depth": "BUT",
+        "ca_cotf": "CoTFormer",
+        "dca_but": "BUT",
+        "dca_cotf_cache": "CoTFormer",
+        "lstm_ut_bidir": "LSTM-UT",
+        "gut_bidir": "GUT",
+        "dca_gut": "GUT",
+        "gated_but_bidir": "Gated BUT",
+        "dca_gated_but": "Gated BUT",
+        "dca_linmem_but": "Linear memory BUT",
+        "dca_fprm_but": "FPRM BUT",
+        "dca_decay_but": "Decay BUT",
+    }.get(model, model)
+
+    if "lstm_ut" not in model.lower():
+        return model_label
+
+    forget_gate, control_input = lstm_ut_configuration_fields(manifest)
+    width = dotted_get(manifest, "model.n_embd", "?")
+    initial_cell = dotted_get(
+        manifest, "model.lstm_initial_cell", "?"
+    )
+
+    control_label = {
+        "previous_and_proposed": "prev+prop",
+        "proposed": "prop only",
+    }.get(
+        str(control_input),
+        str(control_input).replace("_", " "),
+    )
+
+    forget_label = {
+        "learned": "learned forget",
+        "none": "no forget",
+    }.get(str(forget_gate), str(forget_gate).replace("_", " "))
+    initial_label = {
+        "zero": "zero init",
+        "initial_hidden": "hidden init",
+    }.get(str(initial_cell), f"{str(initial_cell).replace('_', ' ')} init")
+
+    return (
+        f"{model_label} d{width} "
+        f"({forget_label}; {control_label}; {initial_label})"
+    )
+
 
 def _plot_seed_curves(
     plt,
@@ -2929,7 +2984,7 @@ def _plot_seed_curves(
     title: str,
     categorical: bool,
 ):
-    figure, axis = plt.subplots(figsize=(12, 6), layout="constrained")
+    figure, axis = plt.subplots(figsize=(11, 7.5), layout="constrained")
     raw = context["raw"]
     bounded_accuracy = "accuracy" in ylabel or ylabel.endswith("_rate")
     category_positions = None
@@ -2951,18 +3006,41 @@ def _plot_seed_curves(
             return ordered
         return [category_positions[value] for value in ordered]
 
-    model_names = {
-        group_id: str(dotted_get(members[0].manifest, "model"))
+    group_labels = {
+        group_id: _plot_configuration_label(members[0].manifest)
         for group_id, members in context["groups"].items()
     }
-    model_labels = {"dca_but": "BUT", "dca_cotf_cache": "CoTFormer"}
-    model_colors = {"dca_but": "#0072B2", "dca_cotf_cache": "#D55E00"}
-    for index, model in enumerate(sorted(set(model_names.values()))):
-        if model not in model_colors:
-            model_colors[model] = plt.get_cmap("tab10")(index % 10)
+
+    label_counts: dict[str, int] = defaultdict(int)
+    for label in group_labels.values():
+        label_counts[label] += 1
+
+    ordered_group_ids = sorted(
+        context["groups"],
+        key=lambda group_id: (group_labels[group_id], group_id),
+    )
+
+    # Use the ten strongest tab20 colors first, followed by their lighter
+    # counterparts. This keeps nearby configurations visually distinct.
+    palette = plt.get_cmap("tab20")
+    palette_order = (
+        0, 2, 4, 6, 8, 10, 12, 14, 16, 18,
+        1, 3, 5, 7, 9, 11, 13, 15, 17, 19,
+    )
+    group_colors = {
+        group_id: palette(palette_order[index % len(palette_order)])
+        for index, group_id in enumerate(ordered_group_ids)
+    }
+    group_order = {
+        group_id: index for index, group_id in enumerate(ordered_group_ids)
+    }
     line_styles = ("--", ":", "-.")
     series_names = {line for _group_id, line in aggregates}
-    for (group_id, line), points in aggregates.items():
+    ordered_aggregates = sorted(
+        aggregates.items(),
+        key=lambda item: (group_order[item[0][0]], item[0][1]),
+    )
+    for (group_id, line), points in ordered_aggregates:
         ordered = sorted(
             points,
             key=_category_sort_key if categorical else lambda value: value,
@@ -2970,19 +3048,27 @@ def _plot_seed_curves(
         summaries = [summarize(points[x]) for x in ordered]
         means = [summary["mean"] for summary in summaries]
         stds = [summary["std"] for summary in summaries]
-        model = model_names[group_id]
-        color = model_colors[model]
-        label = model_labels.get(model, model)
-        if list(model_names.values()).count(model) > 1:
+        color = group_colors[group_id]
+        label = group_labels[group_id]
+
+        # Retain the configuration ID only if two scientifically different
+        # groups happen to produce the same concise display label.
+        if label_counts[label] > 1:
             label += f" [{group_id[:6]}]"
         if len(series_names) > 1:
             label += f" · {line}"
         counts = [summary["n"] for summary in summaries]
-        coverage = str(min(counts)) if min(counts) == max(counts) else f"{min(counts)}–{max(counts)}"
+        coverage = (
+            str(min(counts))
+            if min(counts) == max(counts)
+            else f"{min(counts)}–{max(counts)}"
+        )
         x_coordinates = plotted_x(ordered)
+        marker_interval = max(1, len(x_coordinates) // 10)
         axis.plot(
             x_coordinates, means, color=color, marker="o", markersize=5,
-            linewidth=2.8, label=f"{label} mean (n={coverage})", zorder=4,
+            markevery=marker_interval, linewidth=2.8,
+            label=f"{label} (n={coverage})", zorder=4,
         )
         lower = [mean - std for mean, std in zip(means, stds)]
         upper = [mean + std for mean, std in zip(means, stds)]
@@ -2994,37 +3080,38 @@ def _plot_seed_curves(
         axis.fill_between(
             x_coordinates, lower, upper, color=color, alpha=0.12, zorder=1,
         )
-        members = {run.run_id: run for run in context["groups"][group_id]}
         seed_curves = sorted(
             (run_id, seed_points)
             for (raw_group, raw_line, run_id), seed_points in raw.items()
             if (raw_group, raw_line) == (group_id, line)
         )
-        for index, (run_id, seed_points) in enumerate(seed_curves):
+        for index, (_run_id, seed_points) in enumerate(seed_curves):
             seed_order = sorted(
                 seed_points,
                 key=_category_sort_key if categorical else lambda value: value,
             )
-            short_id = run_id.split("__", 1)[0].replace("_", " ")
-            seed = dotted_get(members[run_id].manifest, "seed")
             axis.plot(
                 plotted_x(seed_order), [seed_points[x] for x in seed_order],
                 color=color, linestyle=line_styles[index % len(line_styles)],
-                alpha=0.65, linewidth=1.2, zorder=3,
-                label=f"{label} · {short_id} · seed {seed}",
+                alpha=0.20, linewidth=0.9, zorder=2,
+                label="_nolegend_",
             )
     axis.set_xlabel(xlabel)
     axis.set_ylabel(ylabel.replace("_", " ").capitalize())
-    band_note = "Shading: ±1 sample SD across runs"
     if bounded_accuracy:
-        band_note += " (display clipped to 0–1)"
         axis.set_ylim(0.0, 1.02)
     if len(series_names) == 1:
         title += f" · {next(iter(series_names)).replace('_', ' ')}"
-    axis.set_title(
-        f"{title.replace('_', ' ')}\n"
-        f"Solid: mean · dashed/dotted: individual runs\n{band_note}",
-        fontsize=12,
+    axis.set_title(title.replace("_", " "), fontsize=13, pad=24)
+    axis.text(
+        0.5,
+        1.01,
+        f"Solid: mean · shading: ±1 sample SD · faint: individual seeds"
+        + (" · display clipped to 0–1" if bounded_accuracy else ""),
+        transform=axis.transAxes,
+        ha="center",
+        va="bottom",
+        fontsize=9,
     )
     axis.grid(alpha=0.25)
     if category_positions is not None:
@@ -3034,8 +3121,14 @@ def _plot_seed_curves(
         )
     if aggregates:
         axis.legend(
-            fontsize=8, loc="upper left", bbox_to_anchor=(1.02, 1),
-            borderaxespad=0, frameon=False, title="Models and runs",
+            fontsize=8,
+            loc="upper center",
+            bbox_to_anchor=(0.5, -0.16),
+            borderaxespad=0,
+            frameon=False,
+            ncol=2,
+            title="Configurations",
+            title_fontsize=9,
         )
     return figure
 
@@ -3062,24 +3155,41 @@ def _plot_summary_rows(
 
 
 def command_plot_horizon(args: argparse.Namespace, runs: Sequence[Run]) -> int:
+    diagonal_only = getattr(args, "diagonal_only", False)
+
+    def is_diagonal(record: Mapping[str, Any]) -> bool:
+        steps = record.get("ca_steps")
+        repeats = record.get("num_repeats")
+        return steps is not None and repeats is not None and steps == repeats
+
     report_dir = _report_dir(args)
     plt = _load_plotting(report_dir)
     context, aggregates = _seed_series(
         runs,
         args,
-        x_getter=lambda record: _pair_label(_pair(record)),
+        x_getter=(
+            (lambda record: int(record["num_repeats"]))
+            if diagonal_only
+            else (lambda record: _pair_label(_pair(record)))
+        ),
         line_getter=lambda _record: args.checkpoint or args.role or "metric",
+        record_filter=is_diagonal if diagonal_only else None,
     )
     if not aggregates:
         raise ValueError("No metric records matched the requested horizon plot.")
+
     figure = _plot_seed_curves(
         plt,
         context,
         aggregates,
-        xlabel="Rule 30 steps : model repeats",
+        xlabel=(
+            "Rule 30 steps = model repeats"
+            if diagonal_only
+            else "Rule 30 steps : model repeats"
+        ),
         ylabel=args.metric,
         title=f"{args.metric} across evaluated horizons",
-        categorical=True,
+        categorical=not diagonal_only,
     )
     figure.savefig(report_dir / "horizon.png", dpi=180)
     plt.close(figure)
@@ -3089,7 +3199,6 @@ def command_plot_horizon(args: argparse.Namespace, runs: Sequence[Run]) -> int:
     _write_analysis_manifest(report_dir, args, runs)
     print(f"Wrote horizon plot and data to {report_dir}")
     return 0
-
 
 def command_plot_training(args: argparse.Namespace, runs: Sequence[Run]) -> int:
     report_dir = _report_dir(args)
@@ -3570,6 +3679,11 @@ def make_parser() -> argparse.ArgumentParser:
         role="internal_repeat_extrapolation",
         checkpoint="best_extrapolation_unconstrained",
         step="all",
+    )
+    horizon_parser.add_argument(
+        "--diagonal-only",
+        action="store_true",
+        help="Plot only records where Rule 30 steps equal model repeats.",
     )
 
     training_parser = subparsers.add_parser(

@@ -1042,7 +1042,8 @@ class GPTBase(nn.Module):
                 cache_reset_source_depth=None,
                 num_recall_repeats =1,
                 recall_cache_intervention=None,
-                recall_value_permutation_offset=1):
+                recall_value_permutation_offset=1,
+                recall_target_block_offset=0):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.sequence_length, f"Cannot forward sequence of length {t}, block size is only {self.config.sequence_length}"
@@ -1083,13 +1084,41 @@ class GPTBase(nn.Module):
 
             recall_target_repeat = repeats - recall_age
 
+        # The K/V block written during repeat r is computed from the state
+        # entering that repeat, i.e. the state after update r - 1.  Block q
+        # therefore holds the state before update q, and block q + 1 holds the
+        # completed requested row.  The offset moves only the block that a
+        # recall cache intervention acts on; the controller, the queried age
+        # and the rollout never depend on it.
+        if isinstance(recall_target_block_offset, bool) or not isinstance(
+            recall_target_block_offset, int
+        ):
+            raise TypeError("recall_target_block_offset must be an integer.")
+        if recall_target_block_offset != 0 and recall_cache_intervention is None:
+            raise ValueError(
+                "recall_target_block_offset requires a recall cache intervention."
+            )
+
+        recall_intervention_block = None
+        if delayed_recall:
+            recall_intervention_block = (
+                recall_target_repeat + recall_target_block_offset
+            )
+
         if recall_cache_intervention is not None:
             if recall_cache_intervention not in RECALL_CACHE_INTERVENTIONS:
                 raise ValueError(
                     "Unsupported recall cache intervention: "
                     f"{recall_cache_intervention!r}."
                 )
-            
+
+            if delayed_recall and not 1 <= recall_intervention_block <= repeats:
+                raise ValueError(
+                    "recall_target_block_offset moves the target outside the "
+                    f"evolution cache: block {recall_intervention_block} is not "
+                    f"between 1 and {repeats}."
+                )
+
             if not delayed_recall:
                 raise ValueError(
                     "Recall cache interventions require delayed_recall=True."
@@ -1319,15 +1348,16 @@ class GPTBase(nn.Module):
                     else "baseline"
                 ),
                 "target_repeat": recall_target_repeat,
+                "target_block_offset": recall_target_block_offset,
                 "recall_age": recall_age,
                 "num_evolution_repeats": repeats,
                 "num_recall_repeats": recall_repeats,
-                "target_cache_block_zero_based": recall_target_repeat - 1,
+                "target_cache_block_zero_based": recall_intervention_block - 1,
                 "target_token_start": (
-                    (recall_target_repeat - 1) * T
+                    (recall_intervention_block - 1) * T
                 ),
                 "target_token_end_exclusive": (
-                    recall_target_repeat * T
+                    recall_intervention_block * T
                 ),
                 "value_permutations": 0,
                 "masked_attention_calls": 0,
@@ -1404,7 +1434,7 @@ class GPTBase(nn.Module):
                 ):
                     layer_metadata = (
                         block.attn.permute_cached_target_values(
-                            target_repeat=recall_target_repeat,
+                            target_repeat=recall_intervention_block,
                             tokens_per_repeat=T,
                             permutation_offset=(
                                 recall_value_permutation_offset
@@ -1454,7 +1484,7 @@ class GPTBase(nn.Module):
                             ),
                             repeat_cache_window=active_repeat_cache_window,
                             recall_cache_intervention=active_recall_mask,
-                            recall_target_repeat=recall_target_repeat,
+                            recall_target_repeat=recall_intervention_block,
                             evolution_repeats=repeats,
                             recall_index=recall_idx,
                         )

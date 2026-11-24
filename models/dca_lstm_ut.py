@@ -316,7 +316,13 @@ class Block(nn.Module):
         cache_context,
         start_index,
         indices=None,
+        close_hidden_gate=False,
+        freeze_cell=False,
     ):
+        # close_hidden_gate and freeze_cell are evaluation-time interventions
+        # (default off; training never sets them). close_hidden_gate: the cell
+        # is updated but not read into x. freeze_cell: the cell is neither
+        # forgotten nor written and the read uses the incoming cell.
         del indices
 
         previous_hidden = self.memory_gate_norm(x)
@@ -363,7 +369,8 @@ class Block(nn.Module):
             )
         )
 
-        cell = retained_memory + write_gate * memory_proposal
+        if not freeze_cell:
+            cell = retained_memory + write_gate * memory_proposal
 
         hidden_gate = torch.sigmoid(
             self._control_projection(
@@ -374,8 +381,12 @@ class Block(nn.Module):
             )
         )
 
-        x = x + hidden_gate * torch.tanh(cell) # should x be replaced by proposed hidden? # TODO
+        if not close_hidden_gate:
+            x = x + hidden_gate * torch.tanh(cell) # should x be replaced by proposed hidden? # TODO
         return x, cell
+
+RECALL_CELL_INTERVENTIONS = (None, "zero_cell", "freeze_cell", "close_output_gate", "swap_cell")
+
 
 class ForwardBackwardEmbedding(nn.Module):
     FORWARD = 0
@@ -514,6 +525,7 @@ class GPTBase(nn.Module):
         return_memory_states=False,
         memory_evolution_repeats=None,
         memory_recall_steps=None,
+        recall_cell_intervention=None,
 
 
         ):
@@ -542,6 +554,21 @@ class GPTBase(nn.Module):
                 raise ValueError(
                     f"recall_age must be between 0 and {repeats - 1}."
                 )
+
+        # Evaluation-only cell intervention applied to every recall repeat
+        # (never set in training; evolution is never affected):
+        #   zero_cell          cell set to 0 before the first recall repeat
+        #   freeze_cell        cell held at its end-of-evolution value and read
+        #   close_output_gate  cell written but not read into x
+        #   swap_cell          before the first recall repeat, every row takes the
+        #                      cell of the previous row in the batch (the first row
+        #                      takes the last row's); the stream x is not swapped
+        if recall_cell_intervention not in RECALL_CELL_INTERVENTIONS:
+            raise ValueError(
+                f"Unsupported recall_cell_intervention: {recall_cell_intervention!r}"
+            )
+        if recall_cell_intervention is not None and not delayed_recall:
+            raise ValueError("recall_cell_intervention requires delayed_recall=True.")
 
         if repeats > self.config.ca_max_relative_age:
             raise ValueError(
@@ -610,7 +637,7 @@ class GPTBase(nn.Module):
             )
 #        cell = torch.zeros_like(x)
 
-        def run_blocks(hidden, cell, blocks):
+        def run_blocks(hidden, cell, blocks, **intervention):
             for block in blocks:
                 hidden, cell = block(
                     hidden,
@@ -618,6 +645,7 @@ class GPTBase(nn.Module):
                     pos_emb_closure,
                     cache_context,
                     start_index=index_shift,
+                    **intervention,
                 )
             return hidden, cell
 
@@ -715,14 +743,26 @@ class GPTBase(nn.Module):
                 ForwardBackwardEmbedding.RECALL,
                 recall_age,
             )
+            recall_block_kwargs = {}
+            if recall_cell_intervention == "zero_cell":
+                cell = torch.zeros_like(cell)
+            elif recall_cell_intervention == "freeze_cell":
+                recall_block_kwargs = {"freeze_cell": True}
+            elif recall_cell_intervention == "close_output_gate":
+                recall_block_kwargs = {"close_hidden_gate": True}
+            elif recall_cell_intervention == "swap_cell":
+                if cell.shape[0] < 2:
+                    raise ValueError("swap_cell needs at least two rows in the batch.")
+                cell = torch.roll(cell, shifts=1, dims=0)
             for recall_step in range(1, recall_repeats + 1):
-                    
+
                 x = x + controller
 
                 x, cell = run_blocks(
                     x,
                     cell,
                     self.transformer.h_mid,
+                    **recall_block_kwargs,
                 )
 
                 if self.controller_application == "subtract":
@@ -769,6 +809,8 @@ class GPTBase(nn.Module):
         }
         if return_memory_states:
             result["memory_states"] = memory_states
+        if delayed_recall:
+            result["recall_cell_intervention"] = recall_cell_intervention
 
 
         if return_repeat_states:

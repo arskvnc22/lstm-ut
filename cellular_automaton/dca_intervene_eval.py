@@ -136,6 +136,18 @@ def parse_args(argv=None):
         default=1,
     )
     parser.add_argument(
+        "--target-block-offset",
+        type=int,
+        default=0,
+        help=(
+            "Shift the intervened cache block relative to the queried repeat "
+            "q. The block written during repeat r holds the state entering "
+            "that repeat (after update r - 1), so 0 targets block q (the state "
+            "before update q) and 1 targets block q + 1 (the completed "
+            "requested row). The query itself is unchanged."
+        ),
+    )
+    parser.add_argument(
         "--diagnostic-split",
         choices=("validation", "test"),
         default="validation",
@@ -214,6 +226,34 @@ def resolve_evaluation_pairs(horizons, intervention_depths, max_relative_age):
             f"{unused}"
         )
     return pairs, skipped
+
+
+def apply_target_block_offset(pairs, skipped, target_block_offset):
+    """Drop pairs whose shifted target block is not an evolution cache block.
+
+    The intervened block is ``intervention_depth + target_block_offset`` and
+    must lie in ``1..horizon``. With an offset of zero every pair is kept.
+    """
+    offset = int(target_block_offset)
+    kept = []
+    skipped = list(skipped)
+    for horizon, depth in pairs:
+        if 1 <= depth + offset <= horizon:
+            kept.append((horizon, depth))
+        else:
+            skipped.append(
+                {
+                    "horizon": horizon,
+                    "intervention_depth": depth,
+                    "reason": "target_block_outside_evolution_cache",
+                }
+            )
+    if not kept:
+        raise ValueError(
+            f"target block offset {offset} leaves no valid "
+            "(horizon, intervention depth) pair"
+        )
+    return kept, skipped
 
 
 def resolve_num_recall_repeats(requested, model_args):
@@ -523,9 +563,12 @@ class RequestedRepeatAttention:
       observations, separately for each head.
       """
 
-      def __init__(self, *, horizon, intervention_depth):
+      def __init__(self, *, horizon, intervention_depth, target_block_offset=0):
           self.horizon = int(horizon)
           self.intervention_depth = int(intervention_depth)
+          # "Requested" statistics describe the block the interventions act
+          # on: block (intervention_depth + target_block_offset).
+          self.target_block_offset = int(target_block_offset)
           self.records = {}
 
       @staticmethod
@@ -576,7 +619,9 @@ class RequestedRepeatAttention:
           }
 
       def add(self, diagnostics, *, batch_size):
-          requested_index = self.intervention_depth - 1
+          requested_index = (
+              self.intervention_depth - 1 + self.target_block_offset
+          )
 
           for diagnostic in diagnostics:
               absolute_repeat = int(diagnostic["repeat_index"])
@@ -755,7 +800,9 @@ class RequestedRepeatAttention:
 
       def finalize(self):
           rows = []
-          requested_index = self.intervention_depth - 1
+          requested_index = (
+              self.intervention_depth - 1 + self.target_block_offset
+          )
 
           for (recall_index, layer_index), entry in sorted(
               self.records.items()
@@ -811,6 +858,7 @@ class RequestedRepeatAttention:
                       "recall_index": recall_index,
                       "middle_layer_index_zero_based": layer_index,
                       "requested_evolution_repeat": self.intervention_depth,
+                      "target_block_offset": self.target_block_offset,
                       "cache_blocks": cache_blocks,
 
                       # Complete mean distribution. The outer list is heads;
@@ -913,14 +961,25 @@ def validate_intervention_metadata(
     horizon,
     num_recall_repeats,
     num_middle_layers,
+    target_block_offset=0,
 ):
     if not records:
         raise RuntimeError("model returned no recall intervention metadata")
+    # The baseline never intervenes, so the model reports offset zero for it.
+    expected_offset = 0 if condition == "baseline" else int(target_block_offset)
     for record in records:
         if record["condition"] != condition:
             raise RuntimeError("condition metadata mismatch")
         if record["target_repeat"] != intervention_depth:
             raise RuntimeError("target-repeat metadata mismatch")
+        if record.get("target_block_offset", 0) != expected_offset:
+            raise RuntimeError("target-block-offset metadata mismatch")
+        if (
+            "target_cache_block_zero_based" in record
+            and record["target_cache_block_zero_based"]
+            != intervention_depth - 1 + expected_offset
+        ):
+            raise RuntimeError("target-block metadata mismatch")
         if record["recall_age"] != horizon - intervention_depth:
             raise RuntimeError("recall-age metadata mismatch")
         if record["num_evolution_repeats"] != horizon:
@@ -958,11 +1017,13 @@ class InterventionForwardContext:
         condition,
         permutation_offset,
         attention_accumulator=None,
+        target_block_offset=0,
     ):
         self.base_context = base_context
         self.model = base_context.model
         self.condition = condition
         self.permutation_offset = int(permutation_offset)
+        self.target_block_offset = int(target_block_offset)
         self.attention_accumulator = attention_accumulator
         self.intervention_metadata = []
         self.batch_trace = BatchTrace()
@@ -973,6 +1034,7 @@ class InterventionForwardContext:
         if self.condition != "baseline":
             call_kwargs["recall_cache_intervention"] = self.condition
             call_kwargs["recall_value_permutation_offset"] = self.permutation_offset
+            call_kwargs["recall_target_block_offset"] = self.target_block_offset
         if self.attention_accumulator is not None:
             call_kwargs["return_attention_diagnostics"] = True
 
@@ -1046,10 +1108,13 @@ def run_condition(
     max_batches,
     num_examples,
     collect_attention,
+    target_block_offset=0,
 ):
     attention = (
         RequestedRepeatAttention(
-            horizon=horizon, intervention_depth=intervention_depth
+            horizon=horizon,
+            intervention_depth=intervention_depth,
+            target_block_offset=target_block_offset,
         )
         if collect_attention
         else None
@@ -1059,6 +1124,7 @@ def run_condition(
         condition=condition,
         permutation_offset=permutation_offset,
         attention_accumulator=attention,
+        target_block_offset=target_block_offset,
     )
     with attention_backend(model, backend):
         full_result = evaluate_delayed_recall_query(
@@ -1080,6 +1146,7 @@ def run_condition(
         horizon=horizon,
         num_recall_repeats=num_recall_repeats,
         num_middle_layers=len(model.transformer.h_mid),
+        target_block_offset=target_block_offset,
     )
     compact = compact_query_result(full_result)
     compact["backend"] = backend
@@ -1202,6 +1269,7 @@ def evaluate_interventions(
       num_examples,
       collect_attention,
       backend_check_policy="once-per-horizon",
+      target_block_offset=0,
   ):
       if backend_check_policy not in (
           "all",
@@ -1235,6 +1303,7 @@ def evaluate_interventions(
               "permutation_offset": permutation_offset,
               "max_batches": max_batches,
               "num_examples": num_examples,
+              "target_block_offset": target_block_offset,
           }
 
           should_check_backend = (
@@ -1319,6 +1388,8 @@ def evaluate_interventions(
                   "intervention_depth": intervention_depth,
                   "recall_age": horizon - intervention_depth,
                   "is_latest_repeat": intervention_depth == horizon,
+                  "target_block_offset": target_block_offset,
+                  "target_cache_block": intervention_depth + target_block_offset,
                   "backend_check": backend_check,
                   "conditions": conditions,
                   "effects": {
@@ -1400,6 +1471,7 @@ def build_summary(
                 "num_recall_repeats": args.num_recall_repeats,
                 "interventions": list(args.interventions),
                 "value_permutation_offset": args.value_permutation_offset,
+                "target_block_offset": args.target_block_offset,
                 "collect_attention": args.collect_attention,
                 "max_batches": args.max_batches,
                 "eval_batch_size_override": args.eval_batch_size,
@@ -1434,6 +1506,13 @@ def print_compact_results(summary, output_path):
             "internal_consistency"
         ]["decoded_requested_repeat"]["cell_accuracy"]
 
+
+    target_block_offset = summary["protocol"].get("target_block_offset", 0)
+    print(
+        f"Target block offset: {target_block_offset} "
+        f"(interventions act on cache block depth + {target_block_offset}; "
+        "target_attn and req_mass refer to that block)"
+    )
 
     mode = summary["protocol"]["attention_mode"]
     print(
@@ -1598,6 +1677,9 @@ def main(argv=None):
         args.intervention_depths,
         model_args.ca_max_relative_age,
     )
+    evaluation_pairs, skipped_pairs = apply_target_block_offset(
+        evaluation_pairs, skipped_pairs, args.target_block_offset
+    )
     model, checkpoint_step, state_entries = load_frozen_model(
         model_args, checkpoint_path, args.expected_step, args.device
     )
@@ -1621,6 +1703,7 @@ def main(argv=None):
           num_examples=args.num_examples,
           collect_attention=args.collect_attention,
           backend_check_policy=args.backend_check_policy,
+          target_block_offset=args.target_block_offset,
         )
     summary = build_summary(
         args=args,

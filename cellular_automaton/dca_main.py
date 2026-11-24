@@ -143,15 +143,18 @@ def get_args():
             "Manual attention remains separate from diagnostic collection."
         ),
     )
-    parser.add_argument(
-          "--lstm_forget_gate",
-          choices=("learned", "none"),
-          default="learned",
-          help=(
-              "LSTM-UT retention ablation. 'learned' uses a learned forget gate; "
-              "'none' retains the previous cell exactly before the additive write."
-          ),
-      )
+    # --lstm_forget_gate and --lstm_control_input are defined in config/base.py
+    # with the same choices and defaults; redefining them here is an argparse
+    # conflict (ca_main.py disables its copies the same way).
+    # parser.add_argument(
+    #       "--lstm_forget_gate",
+    #       choices=("learned", "none"),
+    #       default="learned",
+    #       help=(
+    #           "LSTM-UT retention ablation. 'learned' uses a learned forget gate; "
+    #           "'none' retains the previous cell exactly before the additive write."
+    #       ),
+    #   )
     parser.add_argument(
         "--dca_lstm_memory_evolution_repeats",
         type=positive_int,
@@ -194,14 +197,14 @@ def get_args():
         ),
     )
 
-    parser.add_argument(
-          "--lstm_control_input",
-          choices=("previous_and_proposed", "proposed"),
-          default="previous_and_proposed",
-          help=(
-              "Inputs used by the LSTM-UT forget, write, proposal, and hidden gates."
-          ),
-      )
+    # parser.add_argument(
+    #       "--lstm_control_input",
+    #       choices=("previous_and_proposed", "proposed"),
+    #       default="previous_and_proposed",
+    #       help=(
+    #           "Inputs used by the LSTM-UT forget, write, proposal, and hidden gates."
+    #       ),
+    #   )
 
     parser.add_argument(
         "--ca_train_pairs",

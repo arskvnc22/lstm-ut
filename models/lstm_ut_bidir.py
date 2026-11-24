@@ -316,6 +316,7 @@ class Block(nn.Module):
         cache_context,
         start_index,
         indices=None,
+        close_hidden_gate=False,
     ):
         del indices
 
@@ -373,8 +374,11 @@ class Block(nn.Module):
                 self.proposed_to_hidden,
             )
         )
-
-        x = x + hidden_gate * torch.tanh(cell)  # should x be replaced by proposed hidden? # TODO
+        # close_hidden_gate is an evaluation-time intervention (default off;
+        # training never sets it): the cell is still updated above, but it is
+        # not read back into x on this repeat.
+        if not close_hidden_gate:
+            x = x + hidden_gate * torch.tanh(cell)  # should x be replaced by proposed hidden? # TODO
         return x, cell
 
 

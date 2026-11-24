@@ -572,3 +572,324 @@ def test_compact_console_report_contains_main_intervention_results(capsys):
       assert "all_unique" in output
 
       assert "results/summary.json" in output
+
+
+# ---------------------------------------------------------------------------
+# Target block offset.
+#
+# The cache block written during repeat r holds the state entering that repeat
+# (after update r - 1).  For a query of row q, offset 0 therefore intervenes on
+# block q (the state before update q) and offset 1 on block q + 1 (the completed
+# row q).  These tests check software behaviour only: where the intervention
+# lands, and that offset 0 leaves the existing behaviour untouched.
+# ---------------------------------------------------------------------------
+
+OFFSET_HORIZON = 4
+OFFSET_TOKENS = 8
+OFFSET_RECALL_AGE = 2  # query q = OFFSET_HORIZON - OFFSET_RECALL_AGE = 2
+OFFSET_QUERY = OFFSET_HORIZON - OFFSET_RECALL_AGE
+
+
+@pytest.fixture
+def small_cotformer(monkeypatch):
+    from models import dca_cotf_att_intervene
+
+    monkeypatch.setattr(
+        "models.dca_cotf_att_intervene.tiktoken.get_encoding", lambda _: None
+    )
+    args = SimpleNamespace(
+        model="dca_cotf_att_intervene",
+        vocab_size=2,
+        sequence_length=OFFSET_TOKENS,
+        n_repeat=OFFSET_HORIZON,
+        n_embd=16,
+        n_head=2,
+        n_layer=1,
+        n_layer_begin=0,
+        n_layer_end=0,
+        bias=False,
+        dropout=0.0,
+        attention_mode="bidirectional",
+        attention_implementation="manual",
+        attention_window_length=None,
+        lm_cache="none",
+        positional_encoder="rotary",
+        ca_max_relative_age=OFFSET_HORIZON,
+        ca_controller_application="subtract",
+    )
+    with torch.random.fork_rng():
+        torch.manual_seed(3)
+        model = dca_cotf_att_intervene.GPTBase(args).eval()
+        inputs = torch.randint(0, 2, (3, OFFSET_TOKENS))
+    return model, inputs
+
+
+def _offset_recall(model, inputs, *, recall_age=OFFSET_RECALL_AGE, **kwargs):
+    with torch.no_grad():
+        return model(
+            inputs,
+            get_logits=True,
+            return_all_logits=True,
+            num_repeats=OFFSET_HORIZON,
+            delayed_recall=True,
+            recall_age=recall_age,
+            num_recall_repeats=2,
+            **kwargs,
+        )
+
+
+def _recall_block_mass(outputs):
+    """Mean attention mass per cache block, for each recall application."""
+    return [
+        diagnostic["repeat_mass"].float().mean(dim=(0, 1, 2))
+        for diagnostic in outputs["attention_diagnostics"]
+        if int(diagnostic["repeat_index"]) > OFFSET_HORIZON
+    ]
+
+
+def test_parse_args_target_block_offset_defaults_to_zero():
+    required = [
+        "--run-manifest", "run_manifest.json",
+        "--expected-run-id", "run_1",
+        "--checkpoint-name", "checkpoint.pt",
+        "--expected-step", "12",
+        "--horizons", "6",
+        "--output-dir", "results",
+    ]
+
+    assert evaluator.parse_args(required).target_block_offset == 0
+    assert (
+        evaluator.parse_args(
+            [*required, "--target-block-offset", "1"]
+        ).target_block_offset
+        == 1
+    )
+
+
+def test_apply_target_block_offset_keeps_every_pair_at_zero():
+    pairs = [(6, 1), (6, 5), (6, 6)]
+
+    assert evaluator.apply_target_block_offset(pairs, [], 0) == (pairs, [])
+
+
+def test_apply_target_block_offset_skips_blocks_outside_the_rollout():
+    kept, skipped = evaluator.apply_target_block_offset(
+        [(6, 1), (6, 5), (6, 6)], [], 1
+    )
+
+    # Row 6 of a 6-step rollout lives in the recall application's own block.
+    assert kept == [(6, 1), (6, 5)]
+    assert skipped == [
+        {
+            "horizon": 6,
+            "intervention_depth": 6,
+            "reason": "target_block_outside_evolution_cache",
+        }
+    ]
+    with pytest.raises(ValueError, match="leaves no valid"):
+        evaluator.apply_target_block_offset([(6, 6)], [], 1)
+
+
+@pytest.mark.parametrize("condition", [None, *evaluator.INTERVENTIONS])
+def test_zero_target_block_offset_is_identical_to_omitting_it(
+    small_cotformer, condition
+):
+    model, inputs = small_cotformer
+    kwargs = {} if condition is None else {"recall_cache_intervention": condition}
+
+    omitted = _offset_recall(model, inputs, **kwargs)
+    explicit = _offset_recall(
+        model, inputs, recall_target_block_offset=0, **kwargs
+    )
+
+    assert torch.equal(omitted["logits"], explicit["logits"])
+    assert (
+        omitted["recall_cache_intervention"]
+        == explicit["recall_cache_intervention"]
+    )
+    metadata = explicit["recall_cache_intervention"]
+    assert metadata["target_block_offset"] == 0
+    assert metadata["target_cache_block_zero_based"] == OFFSET_QUERY - 1
+
+
+@pytest.mark.parametrize("condition", evaluator.INTERVENTIONS)
+def test_target_block_offset_one_reports_the_next_block(
+    small_cotformer, condition
+):
+    model, inputs = small_cotformer
+
+    metadata = _offset_recall(
+        model,
+        inputs,
+        recall_cache_intervention=condition,
+        recall_target_block_offset=1,
+    )["recall_cache_intervention"]
+
+    # The query is unchanged; only the intervened block moves.
+    assert metadata["target_repeat"] == OFFSET_QUERY
+    assert metadata["recall_age"] == OFFSET_RECALL_AGE
+    assert metadata["target_block_offset"] == 1
+    assert metadata["target_cache_block_zero_based"] == OFFSET_QUERY
+    assert metadata["target_token_start"] == OFFSET_QUERY * OFFSET_TOKENS
+    assert metadata["target_token_end_exclusive"] == (
+        (OFFSET_QUERY + 1) * OFFSET_TOKENS
+    )
+    evaluator.validate_intervention_metadata(
+        [metadata],
+        condition=condition,
+        intervention_depth=OFFSET_QUERY,
+        horizon=OFFSET_HORIZON,
+        num_recall_repeats=2,
+        num_middle_layers=1,
+        target_block_offset=1,
+    )
+    with pytest.raises(RuntimeError, match="target-block-offset metadata"):
+        evaluator.validate_intervention_metadata(
+            [metadata],
+            condition=condition,
+            intervention_depth=OFFSET_QUERY,
+            horizon=OFFSET_HORIZON,
+            num_recall_repeats=2,
+            num_middle_layers=1,
+            target_block_offset=0,
+        )
+
+
+def test_target_block_offset_one_masks_the_next_block(small_cotformer):
+    model, inputs = small_cotformer
+    shifted = OFFSET_QUERY  # zero-based index of block q + 1
+    unshifted = OFFSET_QUERY - 1
+
+    hidden = _recall_block_mass(
+        _offset_recall(
+            model,
+            inputs,
+            recall_cache_intervention="target-repeat-masked",
+            recall_target_block_offset=1,
+            return_attention_diagnostics=True,
+        )
+    )
+    only = _recall_block_mass(
+        _offset_recall(
+            model,
+            inputs,
+            recall_cache_intervention="target-repeat-only",
+            recall_target_block_offset=1,
+            return_attention_diagnostics=True,
+        )
+    )
+
+    assert len(hidden) == len(only) == 2
+    for mass in hidden:
+        assert mass[shifted].item() == 0.0
+        assert mass[unshifted].item() > 0.0
+    for mass in only:
+        other_evolution = [
+            index for index in range(OFFSET_HORIZON) if index != shifted
+        ]
+        assert mass[other_evolution].sum().item() == 0.0
+        assert mass[shifted].item() > 0.0
+        # Blocks written during recall stay visible.
+        assert mass[OFFSET_HORIZON:].sum().item() > 0.0
+
+
+def test_target_block_offset_one_swaps_only_the_next_block_values(
+    small_cotformer, monkeypatch
+):
+    model, inputs = small_cotformer
+    attention = model.transformer.h_mid[0].attn
+    original = attention.permute_cached_target_values
+    seen = {}
+
+    def spy(**kwargs):
+        before = attention.all_values[0].clone()
+        metadata = original(**kwargs)
+        seen["kwargs"] = kwargs
+        seen["before"] = before
+        seen["after"] = attention.all_values[0].clone()
+        return metadata
+
+    monkeypatch.setattr(attention, "permute_cached_target_values", spy)
+    _offset_recall(
+        model,
+        inputs,
+        recall_cache_intervention="target-value-corruption",
+        recall_target_block_offset=1,
+    )
+
+    assert seen["kwargs"]["target_repeat"] == OFFSET_QUERY + 1
+    start = OFFSET_QUERY * OFFSET_TOKENS
+    end = start + OFFSET_TOKENS
+    populated = OFFSET_HORIZON * OFFSET_TOKENS
+    before, after = seen["before"], seen["after"]
+    assert torch.equal(after[:, :, :start], before[:, :, :start])
+    assert torch.equal(after[:, :, end:populated], before[:, :, end:populated])
+    # Each input receives the previous input's values for that block.
+    assert torch.equal(
+        after[:, :, start:end], before[:, :, start:end].roll(1, dims=0)
+    )
+    assert not torch.equal(after[:, :, start:end], before[:, :, start:end])
+
+
+def test_target_block_offset_rejects_invalid_requests(small_cotformer):
+    model, inputs = small_cotformer
+
+    # Query q = H: block H + 1 is not an evolution block.
+    with pytest.raises(ValueError, match="outside the evolution cache"):
+        _offset_recall(
+            model,
+            inputs,
+            recall_age=0,
+            recall_cache_intervention="target-repeat-masked",
+            recall_target_block_offset=1,
+        )
+    with pytest.raises(ValueError, match="outside the evolution cache"):
+        _offset_recall(
+            model,
+            inputs,
+            recall_cache_intervention="target-repeat-masked",
+            recall_target_block_offset=-OFFSET_QUERY,
+        )
+    with pytest.raises(ValueError, match="requires a recall cache intervention"):
+        _offset_recall(model, inputs, recall_target_block_offset=1)
+    with pytest.raises(TypeError, match="must be an integer"):
+        _offset_recall(
+            model,
+            inputs,
+            recall_cache_intervention="target-repeat-masked",
+            recall_target_block_offset=1.0,
+        )
+
+
+def test_requested_repeat_attention_follows_the_target_block_offset(
+    small_cotformer,
+):
+    model, inputs = small_cotformer
+    outputs = _offset_recall(
+        model,
+        inputs,
+        recall_cache_intervention="target-repeat-masked",
+        recall_target_block_offset=1,
+        return_attention_diagnostics=True,
+    )
+
+    def requested_mass(target_block_offset):
+        accumulator = evaluator.RequestedRepeatAttention(
+            horizon=OFFSET_HORIZON,
+            intervention_depth=OFFSET_QUERY,
+            target_block_offset=target_block_offset,
+        )
+        accumulator.add(
+            outputs["attention_diagnostics"], batch_size=inputs.shape[0]
+        )
+        return accumulator.finalize()
+
+    aligned = requested_mass(1)
+    misaligned = requested_mass(0)
+
+    assert all(row["target_block_offset"] == 1 for row in aligned)
+    evaluator.validate_attention_intervention("target-repeat-masked", aligned)
+    with pytest.raises(RuntimeError, match="nonzero requested-repeat mass"):
+        evaluator.validate_attention_intervention(
+            "target-repeat-masked", misaligned
+        )

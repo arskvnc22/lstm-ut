@@ -16,6 +16,8 @@ import torch
 import config
 import models
 
+import math
+
 from .ca_eval import evaluate_loaded_ca_checkpoint
 from .ca_forward import CAForwardContext, CAForwardPolicy
 from .ca_main import make_ca_fixed_loaders
@@ -65,7 +67,32 @@ CHECKPOINT_FILE_DEFAULTS = {
     ),
 }
 TRAINING_STATS_FILENAME = "training_stats.json"
+def replace_nonfinite_in_place(value, path, found):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            value[key] = replace_nonfinite_in_place(
+                item, f"{path}.{key}", found
+            )
+        return value
 
+    if isinstance(value, (list, tuple)):
+        cleaned = [
+            replace_nonfinite_in_place(item, f"{path}[{index}]", found)
+            for index, item in enumerate(value)
+        ]
+        if isinstance(value, list):
+            value[:] = cleaned
+            return value
+        return cleaned
+
+    if hasattr(value, "item"):
+        value = value.item()
+
+    if isinstance(value, float) and not math.isfinite(value):
+        found.append({"path": path, "value": repr(value)})
+        return None
+
+    return value
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
@@ -231,10 +258,11 @@ def validate_source_run(source_run_dir):
         manifest["resolved_args"], "manifest.resolved_args"
     )
     model_name = model.get("model", resolved.get("model"))
-    if model_name not in {"but_full_depth", "lstm_ut_bidir"}:
+    if model_name not in {"but_full_depth", "lstm_ut_bidir", "gut_bidir", "gated_but_bidir", "lin_lstm_ut_bidir", "but_input_inject", "linmem_but", "fprm_but", "decay_but", "decay_gated_but"}:
         raise ValueError(
-            "standalone evaluation requires model='but_full_depth' or "
-            f"'lstm_ut_bidir'; found {model_name!r}"
+            "standalone evaluation requires model='but_full_depth', "
+            "'lstm_ut_bidir', 'gut_bidir', 'gated_but_bidir', 'lin_lstm_ut_bidir', "
+            f"'but_input_inject', 'linmem_but', 'fprm_but', 'decay_but' or 'decay_gated_but'; found {model_name!r}"
         )
     provenance = _require_mapping(manifest["provenance"], "manifest.provenance")
     checkpoint_dir_value = provenance.get("checkpoint_dir")
@@ -399,9 +427,13 @@ def run_standalone_evaluation(args):
     model_args, compatibility_fallbacks = resolve_source_args(
         manifest, args.device
     )
+    fast_lstm_readout = (
+        model_args.model in {"lstm_ut_bidir", "but_full_depth", "gut_bidir", "gated_but_bidir", "lin_lstm_ut_bidir", "but_input_inject", "linmem_but", "fprm_but", "decay_but", "decay_gated_but"}
+        and model_args.n_layer_end == 0
+        and forward_policy_metadata(manifest)["repeat_cache_window"] is None
+    )
     selected_type = getattr(args, "checkpoint_type", None)
     checkpoint_types = (selected_type,) if selected_type else CHECKPOINT_TYPES
-
     requested_max_repeats = getattr(args, "max_repeats", None)
     if requested_max_repeats is not None:
         if requested_max_repeats <= 0:
@@ -448,9 +480,12 @@ def run_standalone_evaluation(args):
             diagnostic_horizons if requested_max_repeats is not None else None
         ),
     )
+    output_manifest["standalone_evaluation"]["readout_method"] = (
+        "intermediate_states" if fast_lstm_readout else "independent_forwards"
+    )
+    
     write_run_manifest(output_run_dir, output_manifest)
     ensure_notes_file(output_run_dir)
-
     try:
         model = models.make_model_from_args(model_args)
         trained_pairs = tuple(
@@ -512,6 +547,7 @@ def run_standalone_evaluation(args):
                 repeat_diagnostic_examples=model_args.ca_repeat_diagnostic_examples,
                 forward_policy_metadata=policy_metadata,
                 ctx=_autocast_context(model_args),
+                fast_lstm_readout=fast_lstm_readout,
             )
             checkpoint_sources[checkpoint_type] = str(checkpoint_path)
 
@@ -541,6 +577,23 @@ def run_standalone_evaluation(args):
             "checkpoint_sources": checkpoint_sources,
             "compatibility_fallbacks": compatibility_fallbacks,
         }
+        nonfinite_values = []
+        replace_nonfinite_in_place(stats, "$", nonfinite_values)
+
+        if nonfinite_values:
+            detected_at = utc_now()
+            stats["standalone_evaluation"]["nonfinite_values"] = {
+                "detected_at": detected_at,
+                "count": len(nonfinite_values),
+                "items": nonfinite_values,
+            }
+            for item in nonfinite_values:
+                print(
+                    f"[{detected_at}] NON-FINITE metric "
+                    f"{item['path']} = {item['value']}; "
+                    "summary stores null; JSONL omits this metric",
+                    flush=True,
+                )
         summary_path = artifact_dir / "summary.json"
         write_json(summary_path, stats)
         write_eval_metrics(output_run_dir, stats, manifest=output_manifest)

@@ -318,6 +318,11 @@ def train_ca(
     training_forward = CAForwardContext(model, forward_policy)
     evaluation_forward = CAForwardContext(raw_model, forward_policy)
     forward_policy_metadata = forward_policy.metadata()
+    fast_lstm_readout = (
+        args.model in {"lstm_ut_bidir", "but_full_depth", "gut_bidir", "gated_but_bidir", "lin_lstm_ut_bidir", "but_input_inject", "linmem_but", "fprm_but", "decay_but", "decay_gated_but"}
+        and args.n_layer_end == 0
+        and forward_policy.repeat_cache_window is None
+    )
     pin_memory = args.device.type == "cuda"
     train_pairs = tuple(args.ca_train_pairs or ())
     extrapolation_pairs = tuple(args.ca_extrapolation_val_pairs or ())
@@ -490,6 +495,7 @@ def train_ca(
                     pairs=train_pairs,
                     max_batches=args.ca_eval_max_batches,
                     ctx=_autocast_context(args),
+                    fast_lstm_readout=fast_lstm_readout,
                 )
                 selected_pair_key = ca_pair_key(*best_pair)
                 selected_metrics = in_distribution_eval[selected_pair_key][
@@ -529,6 +535,7 @@ def train_ca(
                     num_examples=args.ca_repeat_diagnostic_examples,
                     collect_hidden_states=True,
                     ctx=_autocast_context(args),
+                    fast_lstm_readout=fast_lstm_readout,
                 )
                 rendered_examples = format_ca_repeat_examples(
                     repeat_diagnostics, step=step
@@ -1164,6 +1171,7 @@ def train_ca(
                 repeat_diagnostic_examples=args.ca_repeat_diagnostic_examples,
                 forward_policy_metadata=forward_policy_metadata,
                 ctx=_autocast_context(args),
+                fast_lstm_readout=fast_lstm_readout
             )
 
         best_id_checkpoint_eval = evaluate_checkpoint(

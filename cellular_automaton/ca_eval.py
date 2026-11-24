@@ -504,7 +504,9 @@ def evaluate_ca_repeat_horizon_diagnostics(
     max_batches=None,
     num_examples=1,
     collect_hidden_states=True,
+    fast_lstm_readout=False,
     ctx=None,
+    
 ):
     """Diagnose what each internal repeat decodes to on the same fixed rows.
 
@@ -543,6 +545,18 @@ def evaluate_ca_repeat_horizon_diagnostics(
         collect_hidden_states
         and "return_repeat_states" in inspect.signature(model.forward).parameters
     )
+    if fast_lstm_readout:
+        if (
+            getattr(getattr(model, "config", None), "model", None)
+            not in {"lstm_ut_bidir", "but_full_depth", "gut_bidir", "gated_but_bidir", "lin_lstm_ut_bidir", "but_input_inject", "linmem_but", "fprm_but", "decay_but", "decay_gated_but"}
+            or len(model.transformer.h_end) != 0
+            or not hidden_supported
+            or forward_context.policy.repeat_cache_window is not None
+        ):
+            raise ValueError(
+                "Fast repeat readout requires LSTM-UT, BUT, GUT, gated BUT or their ablations, zero end blocks, "
+                "repeat states, and the full forward policy."
+            )
     if hidden_supported:
         hidden_similarity = {
             (left, right): _new_similarity_accumulator()
@@ -572,24 +586,102 @@ def evaluate_ca_repeat_horizon_diagnostics(
                 current_target = rule30(current_target)
                 all_targets[horizon] = current_target
 
+            # predictions = {0: inputs}
+            # recurrence_targets = {}
+            # repeat_states = None
+            # for repeats in repeat_counts:
+            #     with ctx:
+            #         logits, average_depth, outputs = _forward_all_cells(
+            #             forward_context,
+            #             inputs,
+            #             num_repeats=repeats,
+            #             return_repeat_states=(
+            #                 hidden_supported and repeats == max_repeats
+            #             ),
+            #             return_outputs=True,
+            #         )
+            #     prediction = logits.argmax(dim=-1)
+            #     predictions[repeats] = prediction
+            #     if hidden_supported and repeats == max_repeats:
+            #         repeat_states = outputs.get("repeat_states")
             predictions = {0: inputs}
             recurrence_targets = {}
             repeat_states = None
-            for repeats in repeat_counts:
+
+            if fast_lstm_readout:
                 with ctx:
-                    logits, average_depth, outputs = _forward_all_cells(
+                    final_logits, final_average_depth, outputs = _forward_all_cells(
                         forward_context,
                         inputs,
-                        num_repeats=repeats,
-                        return_repeat_states=(
-                            hidden_supported and repeats == max_repeats
-                        ),
+                        num_repeats=max_repeats,
+                        return_repeat_states=True,
                         return_outputs=True,
                     )
+                repeat_states = outputs.get("repeat_states")
+                if repeat_states is None or len(repeat_states) != max_repeats + 1:
+                    raise ValueError(
+                        "Expected the post-begin state and one state per repeat."
+                    )
+
+            for repeats in repeat_counts:
+                if fast_lstm_readout:
+                    if repeats == max_repeats:
+                        logits = final_logits
+                        average_depth = final_average_depth
+                    else:
+                        with ctx:
+                            logits = model.lm_head(
+                                model.transformer.ln_f(repeat_states[repeats])
+                            )
+                        average_depth = torch.as_tensor(
+                            repeats * len(model.transformer.h_mid)
+                            + len(model.transformer.h_begin),
+                            device=inputs.device,
+                        )
+
+                    # Check two depths against the original computation on
+                    # the first batch of each evaluated row length.
+                    if batch_index == 0 and repeats in {
+                        1, max(1, max_repeats // 2)
+                    }:
+                        with ctx:
+                            reference_logits, reference_depth = _forward_all_cells(
+                                forward_context,
+                                inputs,
+                                num_repeats=repeats,
+                            )
+                        if (
+                            not torch.allclose(
+                                logits, reference_logits,
+                                rtol=1e-3, atol=1e-3, equal_nan=True,
+                            )
+                            or not torch.equal(
+                                logits.argmax(dim=-1),
+                                reference_logits.argmax(dim=-1),
+                            )
+                            or int(average_depth.item())
+                            != int(reference_depth.item())
+                        ):
+                            raise AssertionError(
+                                f"Intermediate-state readout differs from "
+                                f"the depth-{repeats} forward."
+                            )
+                else:
+                    with ctx:
+                        logits, average_depth, outputs = _forward_all_cells(
+                            forward_context,
+                            inputs,
+                            num_repeats=repeats,
+                            return_repeat_states=(
+                                hidden_supported and repeats == max_repeats
+                            ),
+                            return_outputs=True,
+                        )
+                    if hidden_supported and repeats == max_repeats:
+                        repeat_states = outputs.get("repeat_states")
+
                 prediction = logits.argmax(dim=-1)
                 predictions[repeats] = prediction
-                if hidden_supported and repeats == max_repeats:
-                    repeat_states = outputs.get("repeat_states")
 
                 for horizon in target_horizons:
                     target = all_targets[horizon]
@@ -1098,7 +1190,160 @@ def evaluate_ca_target_lengths(
 def ca_pair_key(ca_steps, num_repeats):
     """Return the stable logging/checkpoint key for one horizon-depth pair."""
     return f"steps_{ca_steps}_repeats_{num_repeats}"
+@torch.no_grad()
+def _evaluate_ca_pairs_from_repeat_states(
+    forward_context,
+    eval_loaders,
+    device,
+    *,
+    pairs,
+    max_batches=None,
+    ctx=None,
+):
+    pairs = tuple((int(steps), int(repeats)) for steps, repeats in pairs)
+    if not pairs:
+        return {}
+    if any(steps <= 0 or repeats <= 0 for steps, repeats in pairs):
+        raise ValueError("CA steps and repeat counts must be positive.")
 
+    model = forward_context.model
+    if (
+        getattr(getattr(model, "config", None), "model", None)
+        not in {"lstm_ut_bidir", "but_full_depth", "gut_bidir", "gated_but_bidir", "lin_lstm_ut_bidir", "but_input_inject", "linmem_but", "fprm_but", "decay_but", "decay_gated_but"}
+        or len(model.transformer.h_end) != 0
+        or forward_context.policy.repeat_cache_window is not None
+        or "return_repeat_states" not in inspect.signature(model.forward).parameters
+    ):
+        raise ValueError(
+            "Intermediate-state pair evaluation requires LSTM-UT, BUT, GUT, gated BUT or their ablations, "
+            "zero end blocks, repeat states, and the full forward policy."
+        )
+
+    repeat_counts = sorted({repeats for _, repeats in pairs})
+    steps_needed = {steps for steps, _ in pairs}
+    pairs_by_repeat = {
+        repeats: sorted({
+            steps for steps, pair_repeats in pairs
+            if pair_repeats == repeats
+        })
+        for repeats in repeat_counts
+    }
+    max_repeats = max(repeat_counts)
+    max_steps = max(steps_needed)
+    ctx = ctx or nullcontext()
+    was_training = model.training
+    model.eval()
+    by_length = {}
+
+    try:
+        for num_cells, dataloader in eval_loaders.items():
+            counters = {pair: new_ca_counters() for pair in pairs}
+
+            for batch_index, batch in enumerate(dataloader):
+                if max_batches is not None and batch_index >= max_batches:
+                    break
+
+                inputs = batch["input_id"].to(
+                    device, dtype=torch.long, non_blocking=True
+                )
+
+                targets = {}
+                target = inputs
+                for steps in range(1, max_steps + 1):
+                    target = rule30(target)
+                    if steps in steps_needed:
+                        targets[steps] = target
+
+                with ctx:
+                    final_logits, final_depth, outputs = _forward_all_cells(
+                        forward_context,
+                        inputs,
+                        num_repeats=max_repeats,
+                        return_repeat_states=True,
+                        return_outputs=True,
+                    )
+                states = outputs.get("repeat_states")
+                if states is None or len(states) != max_repeats + 1:
+                    raise ValueError(
+                        "Expected the post-begin state and one state per repeat."
+                    )
+
+                for repeats in repeat_counts:
+                    if repeats == max_repeats:
+                        logits = final_logits
+                        average_depth = final_depth
+                    else:
+                        with ctx:
+                            logits = model.lm_head(
+                                model.transformer.ln_f(states[repeats])
+                            )
+                        average_depth = torch.as_tensor(
+                            repeats * len(model.transformer.h_mid)
+                            + len(model.transformer.h_begin),
+                            device=inputs.device,
+                        )
+
+                        # Check every requested depth on the first batch.
+                        if batch_index == 0:
+                            with ctx:
+                                reference, reference_depth = _forward_all_cells(
+                                    forward_context,
+                                    inputs,
+                                    num_repeats=repeats,
+                                )
+                            if (
+                                not torch.allclose(
+                                    logits, reference,
+                                    rtol=1e-3, atol=1e-3, equal_nan=True,
+                                )
+                                or not torch.equal(
+                                    logits.argmax(-1),
+                                    reference.argmax(-1),
+                                )
+                                or int(average_depth.item())
+                                != int(reference_depth.item())
+                            ):
+                                raise AssertionError(
+                                    "Intermediate-state readout differs at "
+                                    f"repeat {repeats}."
+                                )
+
+                    for steps in pairs_by_repeat[repeats]:
+                        labels = targets[steps]
+                        loss = F.cross_entropy(
+                            logits.reshape(-1, 2),
+                            labels.reshape(-1),
+                        )
+                        update_ca_counters(
+                            counters[(steps, repeats)],
+                            logits,
+                            labels,
+                            loss=loss,
+                            average_depth=average_depth,
+                        )
+
+            if next(iter(counters.values()))["num_batches"] == 0:
+                raise ValueError("Evaluation consumed no batches.")
+
+            by_length[str(num_cells)] = {
+                pair: finalize_ca_metrics(counter)
+                for pair, counter in counters.items()
+            }
+    finally:
+        if was_training:
+            model.train()
+
+    return {
+        ca_pair_key(steps, repeats): {
+            "ca_steps": steps,
+            "num_repeats": repeats,
+            "by_length": {
+                length: metrics[(steps, repeats)]
+                for length, metrics in by_length.items()
+            },
+        }
+        for steps, repeats in pairs
+    }
 
 def evaluate_ca_pairs(
     forward_context: CAForwardContext,
@@ -1108,8 +1353,19 @@ def evaluate_ca_pairs(
     pairs,
     max_batches=None,
     ctx=None,
+    fast_lstm_readout=False,
 ):
     """Evaluate every configured CA-step/model-repeat pair at every length."""
+    if fast_lstm_readout:
+        return _evaluate_ca_pairs_from_repeat_states(
+            forward_context,
+            eval_loaders,
+            device,
+            pairs=pairs,
+            max_batches=max_batches,
+            ctx=ctx,
+        )
+
     return {
         ca_pair_key(ca_steps, num_repeats): {
             "ca_steps": ca_steps,
@@ -1140,6 +1396,7 @@ def run_final_ca_evaluation(
     external_ca_steps=(),
     max_batches=None,
     ctx=None,
+    fast_lstm_readout=False,
 ):
     """Run the complete post-training CA generalization evaluation.
 
@@ -1157,6 +1414,7 @@ def run_final_ca_evaluation(
                 pairs=trained_pairs,
                 max_batches=max_batches,
                 ctx=ctx,
+                fast_lstm_readout=fast_lstm_readout,
             ),
         }
         baseline_pairs = set(trained_pairs)
@@ -1182,23 +1440,20 @@ def run_final_ca_evaluation(
         "external_rollout": {},
     }
 
-    for ca_steps, num_repeats in internal_pairs:
-        if (ca_steps, num_repeats) in baseline_pairs:
-            continue
-        key = ca_pair_key(ca_steps, num_repeats)
-        results["internal_repeat_extrapolation"][key] = {
-            "ca_steps": ca_steps,
-            "num_repeats": num_repeats,
-            "by_length": evaluate_ca_target_lengths(
-                forward_context,
-                eval_loaders,
-                device,
-                ca_steps=ca_steps,
-                num_repeats=num_repeats,
-                max_batches=max_batches,
-                ctx=ctx,
-            ),
-        }
+    remaining_internal_pairs = [
+        (ca_steps, num_repeats)
+        for ca_steps, num_repeats in internal_pairs
+        if (ca_steps, num_repeats) not in baseline_pairs
+    ]
+    results["internal_repeat_extrapolation"] = evaluate_ca_pairs(
+        forward_context,
+        eval_loaders,
+        device,
+        pairs=remaining_internal_pairs,
+        max_batches=max_batches,
+        ctx=ctx,
+        fast_lstm_readout=fast_lstm_readout,
+    )
 
     for target_ca_steps in external_ca_steps:
         if target_ca_steps % trained_ca_steps != 0:
@@ -1259,6 +1514,7 @@ def evaluate_loaded_ca_checkpoint(
     repeat_diagnostic_examples=1,
     forward_policy_metadata=None,
     ctx=None,
+    fast_lstm_readout=False,
 ):
     """Run the canonical final evaluation for one already-loaded checkpoint.
 
@@ -1279,6 +1535,7 @@ def evaluate_loaded_ca_checkpoint(
         external_ca_steps=external_ca_steps,
         max_batches=final_eval_max_batches,
         ctx=ctx,
+        fast_lstm_readout=fast_lstm_readout,
     )
     repeat_diagnostics = None
     preserved_cache_clean_state_transitions = None
@@ -1298,6 +1555,7 @@ def evaluate_loaded_ca_checkpoint(
             num_examples=repeat_diagnostic_examples,
             collect_hidden_states=True,
             ctx=ctx,
+            fast_lstm_readout=fast_lstm_readout,
         )
         if supports_clean_state_intervention(forward_context.model):
             preserved_cache_clean_state_transitions = (

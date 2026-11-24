@@ -271,8 +271,12 @@ def _fake_checkpoint_analysis(metadata):
     }
 
 
+@pytest.mark.parametrize(
+    "model_name, expected_fast",
+    (("but_full_depth", True), ("lstm_ut_bidir", True)),
+)
 def test_standalone_evaluation_runs_exactly_three_checkpoints_and_preserves_source(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, model_name, expected_fast
 ):
     source_dir = tmp_path / "run_900__but_full_depth"
     checkpoint_dir = tmp_path / "checkpoints"
@@ -281,6 +285,8 @@ def test_standalone_evaluation_runs_exactly_three_checkpoints_and_preserves_sour
     source_dir.mkdir()
     checkpoint_dir.mkdir()
     manifest = _source_manifest(tmp_path)
+    manifest["model"]["model"] = model_name
+    manifest["resolved_args"]["model"] = model_name
     write_json(source_dir / "run_manifest.json", manifest)
     source_before = (source_dir / "run_manifest.json").read_bytes()
 
@@ -325,9 +331,11 @@ def test_standalone_evaluation_runs_exactly_three_checkpoints_and_preserves_sour
     )
 
     evaluated_labels = []
+    readout_flags = []
 
     def fake_evaluate(*_args, **kwargs):
         evaluated_labels.append(kwargs["label"])
+        readout_flags.append(kwargs["fast_lstm_readout"])
         return _fake_checkpoint_analysis(kwargs["checkpoint_metadata"])
 
     monkeypatch.setattr(
@@ -352,11 +360,16 @@ def test_standalone_evaluation_runs_exactly_three_checkpoints_and_preserves_sour
     )
 
     assert evaluated_labels == list(CHECKPOINT_TYPES)
+    assert readout_flags == [expected_fast] * len(CHECKPOINT_TYPES)
     assert result["checkpoint_types"] == list(CHECKPOINT_TYPES)
     assert (source_dir / "run_manifest.json").read_bytes() == source_before
     output_manifest = read_validated_manifest(output_dir / "run_manifest.json")
     assert output_manifest["status"] == "completed"
     assert output_manifest["provenance"]["source_run_id"] == manifest["run_id"]
+    assert output_manifest["standalone_evaluation"]["readout_method"] == (
+        "intermediate_states" if expected_fast else "independent_forwards"
+    )
+    assert (output_dir / "notes.md").is_file()
     assert (output_dir / "eval_metrics.jsonl").is_file()
     assert (artifact_dir / "summary.json").is_file()
     summary = read_json(artifact_dir / "summary.json")

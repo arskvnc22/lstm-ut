@@ -1,9 +1,12 @@
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from models.but_full_depth import GPTBase as BUTGPTBase
+from models.lstm_ut_bidir import GPTBase as LSTMBidirGPTBase
 
 from cellular_automaton.ca_eval import (
     _forward_all_cells,
@@ -593,6 +596,216 @@ def test_repeat_horizon_matrix_recurrence_hidden_states_and_literal_rows():
         "decoded transition:\nprediction repeat 4 vs "
         "Rule30(prediction repeat 3)\n12/12 cells = 1.0000"
     ) in rendered
+
+
+def _small_lstm_for_repeat_diagnostics(monkeypatch, *, n_layer_end=0):
+    monkeypatch.setattr("models.lstm_ut_bidir.tiktoken.get_encoding", lambda _: None)
+    args = SimpleNamespace(
+        model="lstm_ut_bidir",
+        vocab_size=2,
+        sequence_length=16,
+        n_repeat=4,
+        n_embd=32,
+        n_head=4,
+        n_layer=1 + n_layer_end,
+        n_layer_begin=0,
+        n_layer_end=n_layer_end,
+        bias=True,
+        dropout=0.0,
+        attention_mode="bidirectional",
+        attention_window_length=None,
+        lstm_forget_gate="learned",
+        lstm_control_input="previous_and_proposed",
+        lstm_initial_cell="zero",
+        lm_cache="none",
+        positional_encoder="rotary",
+    )
+    with torch.random.fork_rng():
+        torch.manual_seed(7)
+        return LSTMBidirGPTBase(args)
+
+
+def _replace_nonfinite_for_comparison(value):
+    if isinstance(value, dict):
+        return {
+            key: _replace_nonfinite_for_comparison(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_nonfinite_for_comparison(item) for item in value]
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    return value
+
+
+@pytest.mark.parametrize(
+    "max_repeats, expected_slow_calls, expected_fast_calls",
+    ((1, [1, 1], [1, 1, 1]), (4, [1, 2, 3, 4] * 2, [4, 1, 2, 4])),
+)
+def test_fast_lstm_readout_matches_independent_forwards_and_reuses_repeats(
+    monkeypatch, max_repeats, expected_slow_calls, expected_fast_calls
+):
+    model = _small_lstm_for_repeat_diagnostics(monkeypatch).eval()
+    dataloader = DataLoader(
+        Rule30Dataset(num_samples=4, num_cells=12, seed=33),
+        batch_size=2,
+        shuffle=False,
+    )
+    inputs = next(iter(dataloader))["input_id"]
+    with torch.no_grad():
+        states = model(
+            inputs,
+            get_logits=True,
+            return_all_logits=True,
+            num_repeats=max_repeats,
+            return_repeat_states=True,
+        )["repeat_states"]
+        for repeats in range(1, max_repeats + 1):
+            direct = model(
+                inputs,
+                get_logits=True,
+                return_all_logits=True,
+                num_repeats=repeats,
+            )["logits"]
+            decoded = model.lm_head(model.transformer.ln_f(states[repeats]))
+            assert torch.equal(decoded, direct)
+
+    calls = []
+
+    def record_forward(_model, _args, kwargs):
+        calls.append(kwargs["num_repeats"])
+
+    hook = model.register_forward_pre_hook(record_forward, with_kwargs=True)
+    try:
+        options = dict(
+            max_repeats=max_repeats,
+            target_horizons=range(max_repeats + 1),
+            num_examples=1,
+        )
+        slow = evaluate_ca_repeat_horizon_diagnostics(
+            forward_context(model), dataloader, "cpu", **options
+        )
+        slow_calls = calls[:]
+        calls.clear()
+        fast = evaluate_ca_repeat_horizon_diagnostics(
+            forward_context(model),
+            dataloader,
+            "cpu",
+            fast_lstm_readout=True,
+            **options,
+        )
+    finally:
+        hook.remove()
+
+    assert slow_calls == expected_slow_calls
+    assert calls == expected_fast_calls
+    assert _replace_nonfinite_for_comparison(fast) == (
+        _replace_nonfinite_for_comparison(slow)
+    )
+
+def test_fast_but_readout_matches_independent_forwards(monkeypatch):
+    monkeypatch.setattr(
+        "models.but_full_depth.tiktoken.get_encoding", lambda _: None
+    )
+    args = SimpleNamespace(
+        model="but_full_depth",
+        vocab_size=2,
+        sequence_length=16,
+        n_repeat=4,
+        n_embd=32,
+        n_head=4,
+        n_layer=1,
+        n_layer_begin=0,
+        n_layer_end=0,
+        bias=False,
+        dropout=0.0,
+        attention_mode="bidirectional",
+        attention_window_length=None,
+        lm_cache="none",
+        positional_encoder="rotary",
+        depth_random_method="uniform",
+        min_repeat=1,
+    )
+    with torch.random.fork_rng():
+        torch.manual_seed(11)
+        model = BUTGPTBase(args)
+
+    loader = DataLoader(
+        Rule30Dataset(num_samples=4, num_cells=12, seed=33),
+        batch_size=2,
+        shuffle=False,
+    )
+    context = forward_context(model)
+    pairs = ((1, 1), (2, 2), (3, 3), (4, 4), (2, 4))
+
+    calls = []
+
+    def record_forward(_model, _args, kwargs):
+        calls.append(kwargs["num_repeats"])
+
+    hook = model.register_forward_pre_hook(record_forward, with_kwargs=True)
+    try:
+        slow_pairs = evaluate_ca_pairs(
+            context, {12: loader}, "cpu", pairs=pairs
+        )
+        slow_pair_calls = len(calls)
+        calls.clear()
+
+        fast_pairs = evaluate_ca_pairs(
+            context, {12: loader}, "cpu",
+            pairs=pairs, fast_lstm_readout=True,
+        )
+        fast_pair_calls = len(calls)
+        calls.clear()
+
+        options = dict(
+            max_repeats=4,
+            target_horizons=range(5),
+            num_examples=0,
+        )
+        slow_diagnostics = evaluate_ca_repeat_horizon_diagnostics(
+            context, loader, "cpu", **options
+        )
+        slow_diagnostic_calls = len(calls)
+        calls.clear()
+
+        fast_diagnostics = evaluate_ca_repeat_horizon_diagnostics(
+            context, loader, "cpu",
+            fast_lstm_readout=True, **options
+        )
+        fast_diagnostic_calls = len(calls)
+    finally:
+        hook.remove()
+
+    assert fast_pairs == slow_pairs
+    assert _replace_nonfinite_for_comparison(fast_diagnostics) == (
+        _replace_nonfinite_for_comparison(slow_diagnostics)
+    )
+    assert fast_pair_calls < slow_pair_calls
+    assert fast_diagnostic_calls < slow_diagnostic_calls
+def test_fast_lstm_readout_rejects_end_blocks_and_recent_cache_policy(monkeypatch):
+    with pytest.raises(ValueError, match="zero end blocks"):
+        evaluate_ca_repeat_horizon_diagnostics(
+            forward_context(
+                _small_lstm_for_repeat_diagnostics(monkeypatch, n_layer_end=1)
+            ),
+            [],
+            "cpu",
+            max_repeats=2,
+            fast_lstm_readout=True,
+        )
+
+    with pytest.raises(ValueError, match="full forward policy"):
+        evaluate_ca_repeat_horizon_diagnostics(
+            forward_context(
+                _small_lstm_for_repeat_diagnostics(monkeypatch),
+                repeat_cache_window=2,
+            ),
+            [],
+            "cpu",
+            max_repeats=2,
+            fast_lstm_readout=True,
+        )
 
 
 def test_loaded_checkpoint_evaluation_skips_unsupported_clean_state_probe(capsys):

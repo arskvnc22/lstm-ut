@@ -18,6 +18,20 @@ from . import dca_cotf_cache
 from . import dca_cotf_att_intervene
 from . import dca_lstm_ut
 from . import lstm_ut_bidir
+from . import gut_bidir
+from . import dca_gut
+from . import gated_but_bidir
+from . import lin_lstm_ut_bidir
+from . import but_input_inject
+from . import linmem_but
+from . import fprm_but
+from . import decay_but
+from . import dca_gated_but
+from . import dca_linmem_but
+from . import dca_fprm_but
+from . import dca_decay_but
+from . import decay_gated_but
+from . import dca_decay_gated_but
 from . import cotformer_llm
 from . import but_llm
 from . import lstm_ut_llm
@@ -48,6 +62,20 @@ MODELS = {
     "dca_cotf_att_intervene" : dca_cotf_att_intervene.GPTBase,
     "dca_lstm_ut" : dca_lstm_ut.GPTBase,
     "lstm_ut_bidir" : lstm_ut_bidir.GPTBase,
+    "gut_bidir" : gut_bidir.GPTBase,
+    "dca_gut" : dca_gut.GPTBase,
+    "gated_but_bidir" : gated_but_bidir.GPTBase,
+    "lin_lstm_ut_bidir" : lin_lstm_ut_bidir.GPTBase,
+    "but_input_inject" : but_input_inject.GPTBase,
+    "linmem_but" : linmem_but.GPTBase,
+    "fprm_but": fprm_but.GPTBase,
+    "decay_but": decay_but.GPTBase,
+    "dca_gated_but" : dca_gated_but.GPTBase,
+    "dca_linmem_but" : dca_linmem_but.GPTBase,
+    "dca_fprm_but" : dca_fprm_but.GPTBase,
+    "dca_decay_but" : dca_decay_but.GPTBase,
+    "decay_gated_but" : decay_gated_but.GPTBase,
+    "dca_decay_gated_but" : dca_decay_gated_but.GPTBase,
     "lstm_ut_llm" : lstm_ut_llm.GPTBase,
     "cotformer_llm" : cotformer_llm.GPTBase,
     "but_llm" : but_llm.GPTBase,
